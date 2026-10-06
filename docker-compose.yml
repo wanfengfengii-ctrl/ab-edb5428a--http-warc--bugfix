@@ -1,0 +1,46 @@
+# WARC ingestion audit stack.
+#
+# The host-side port is configurable: HOST_PORT=9090 docker compose up --build
+# maps the service to host port 9090 (default 8080).  The one-shot "verify"
+# service waits until the API is healthy, runs tests + smoke checks, reports
+# via its exit code and exits:
+#
+#     docker compose up --build verify
+#     docker compose ps                       # verify shows Exited(0)
+#
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: warc-audit:latest
+    environment:
+      PORT: "8080"
+    ports:
+      # configurable host port; container port stays 8080
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request,sys; p=os.environ.get('PORT','8080'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz', timeout=2).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    image: warc-audit:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      AUDIT_URL: "http://api:8080"
+    entrypoint: ["python", "scripts/verify.py"]
+    # One-shot: report via exit code, then stop.
+    restart: "no"
