@@ -58,6 +58,60 @@ def http_response_headers_only(
     return eol.join(lines) + eol + eol
 
 
+def chunked_transfer(
+    chunks: list[bytes],
+    *,
+    extensions: list[bytes | None] | None = None,
+    trailers: tuple[tuple[str, str], ...] = (),
+    last_chunk_ext: bytes | None = None,
+) -> bytes:
+    """Encode entity chunks as a strict RFC 7230 chunked transfer body.
+
+    ``extensions`` optionally aligns one raw extension string (without the
+    leading ';') with each chunk's size line; ``last_chunk_ext`` decorates
+    the zero-size terminating chunk; ``trailers`` become the trailer
+    section.  The encoding always ends with the canonical CRLF CRLF.
+    """
+    exts = extensions if extensions is not None else [None] * len(chunks)
+    out = b""
+    for data, ext in zip(chunks, exts):
+        size_line = f"{len(data):X}".encode("ascii")
+        if ext:
+            size_line += b";" + ext
+        out += size_line + b"\r\n" + data + b"\r\n"
+    last = b"0"
+    if last_chunk_ext:
+        last += b";" + last_chunk_ext
+    out += last + b"\r\n"
+    for name, value in trailers:
+        out += f"{name}: {value}".encode("ascii") + b"\r\n"
+    out += b"\r\n"
+    return out
+
+
+def http_chunked_response(
+    transfer_body: bytes,
+    *,
+    status: int = 200,
+    reason: str = "OK",
+    extra_headers: tuple[tuple[str, str], ...] = (),
+    version: str = "HTTP/1.1",
+    eol: bytes = b"\r\n",
+) -> bytes:
+    """HTTP response framed with ``Transfer-Encoding: chunked``.
+
+    ``transfer_body`` is the already-encoded chunked section (size lines,
+    chunk data, last chunk and trailers); the decoded entity is the
+    concatenation of the chunk data only.
+    """
+    lines = [f"{version} {status} {reason}".encode("ascii")]
+    lines.append(b"Content-Type: application/octet-stream")
+    lines.append(b"Transfer-Encoding: chunked")
+    for name, value in extra_headers:
+        lines.append(f"{name}: {value}".encode())
+    return eol.join(lines) + eol + eol + transfer_body
+
+
 def warc_record(
     warc_type: str,
     block: bytes,

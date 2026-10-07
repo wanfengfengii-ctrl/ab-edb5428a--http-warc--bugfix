@@ -6,8 +6,9 @@ It waits for the API healthcheck to pass, then runs, in order:
 1. a byte-compilation / import build check,
 2. the full unit-test suite,
 3. API smoke tests against the running service:
-   a valid package, a corrupted block digest and a dangling revisit
-   reference.
+   a valid package, a corrupted block digest, a dangling revisit
+   reference, a valid two-chunk chunked response and a malformed
+   chunked response.
 
 The process exits non-zero on the first failed stage so ``docker compose
 up`` (or ``docker compose up verify``) reports the verdict via the exit
@@ -19,6 +20,7 @@ Environment:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -31,6 +33,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.warc_factory import (  # noqa: E402
     build_valid_archive,
+    chunked_transfer,
+    http_chunked_response,
     http_response,
     new_record_id,
     payload_digest_of,
@@ -104,7 +108,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def smoke_valid() -> None:
-    stage("smoke 1/3: valid package accepted")
+    stage("smoke 1/5: valid package accepted")
     data, _rid = build_valid_archive()
     status, body = post_archive(data)
     check(status == 200, f"HTTP 200 (got {status}, {body})")
@@ -124,7 +128,7 @@ def smoke_valid() -> None:
 
 
 def smoke_bad_digest() -> None:
-    stage("smoke 2/3: corrupted block digest rejected")
+    stage("smoke 2/5: corrupted block digest rejected")
     data, _rid = build_valid_archive()
     corrupted = bytearray(data)
     corrupted[data.index(b"software:")] = ord("Z")  # flip a payload byte
@@ -139,7 +143,7 @@ def smoke_bad_digest() -> None:
 
 
 def smoke_bad_reference() -> None:
-    stage("smoke 3/3: dangling revisit reference rejected")
+    stage("smoke 3/5: dangling revisit reference rejected")
     body_text = b"<html>revisited</html>"
     pd = payload_digest_of(body_text)
     package = b"".join(
@@ -172,6 +176,58 @@ def smoke_bad_reference() -> None:
     print(json.dumps(err, indent=2))
 
 
+def smoke_chunked_valid() -> None:
+    stage("smoke 4/5: valid two-chunk Transfer-Encoding response accepted")
+    entity = b"Wikipedia"
+    raw_transfer = chunked_transfer([entity[:4], entity[4:]])
+    block = http_chunked_response(raw_transfer)
+    package = warc_record(
+        "response",
+        block,
+        target_uri="http://example.invalid/",
+        payload_digest=payload_digest_of(entity),
+    )
+    status, body = post_archive(package)
+    check(status == 200, f"HTTP 200 (got {status}, {body})")
+    check(body["ok"] is True, "ok flag")
+    rec = body["records"][0]
+    check(rec["type"] == "response", "record is a response")
+    # The payload digest is always over the DECODED entity, never over the
+    # raw chunked transfer bytes.
+    check(
+        rec["payloadDigest"] == hashlib.sha256(entity).hexdigest(),
+        "payload digest over decoded entity (Wiki+pedia)",
+    )
+    # Block digest still covers the undecoded original record block.
+    check(
+        rec["blockDigest"] == hashlib.sha256(block).hexdigest(),
+        "block digest over the raw chunked block",
+    )
+    check(rec["blockLength"] == len(block), "block length is the raw block length")
+    print(json.dumps(rec, indent=2))
+
+
+def smoke_chunked_malformed() -> None:
+    stage("smoke 5/5: malformed chunked framing rejected as content error")
+    block = http_chunked_response(b"4\r\nWiki\rX\r\n0\r\n\r\n")  # bad data boundary
+    package = warc_record(
+        "response",
+        block,
+        target_uri="http://example.invalid/",
+        payload_digest=payload_digest_of(b"Wikipedia"),
+    )
+    status, body = post_archive(package)
+    check(status == 400, f"HTTP 400 (got {status})")
+    err = body["error"]
+    check(err["code"] == 4002, f"stable error code 4002 (got {err['code']})")
+    check(
+        err["reason"] == "invalid_http_message",
+        f"reason invalid_http_message (got {err['reason']})",
+    )
+    check(err["record"] == 1, f"first failing record is #1 (got {err.get('record')})")
+    print(json.dumps(err, indent=2))
+
+
 def main() -> None:
     wait_for_ready()
     build_check()
@@ -179,6 +235,8 @@ def main() -> None:
     smoke_valid()
     smoke_bad_digest()
     smoke_bad_reference()
+    smoke_chunked_valid()
+    smoke_chunked_malformed()
     print("\nALL VERIFICATION STAGES PASSED")
     sys.exit(0)
 

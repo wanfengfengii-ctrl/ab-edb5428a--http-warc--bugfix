@@ -26,6 +26,15 @@ or `revisit`):
 - `response` / `revisit` also carry a `WARC-Payload-Digest` over the HTTP
   entity body. A `response` must contain the complete body; a canonical
   headers-only `revisit` has its digest proven via the reference below.
+- The HTTP block is framed either by exactly one `Content-Length` or by
+  `Transfer-Encoding: chunked` adjudicated per RFC 7230: chunk sizes are
+  strict hexadecimal, chunk extensions and trailer fields must match the
+  protocol grammar, every data boundary must be CRLF, and the zero-size
+  last chunk must terminate the message with no trailing bytes. The
+  payload digest is always computed over the **decoded** entity, while
+  the block digest keeps covering the raw, undecoded record block; the
+  two domains are never mixed. Truncation, illegal boundaries and bytes
+  after the terminator are stable content errors (never internal ones).
 - A `revisit` may only use `WARC-Refers-To` to point to an **earlier**
   `response` in the same file whose payload digest is identical. Forward and
   dangling references, references to non-responses and payload mismatches are
@@ -70,6 +79,13 @@ number:
 | 4007 | request  | `body_too_large` (413, > 16 MiB) |
 | 4008 | request  | `empty_body` (400) |
 
+`invalid_http_message` covers malformed HTTP framing (bad status line,
+duplicate headers, a non-chunked `Transfer-Encoding`, chunked plus
+`Content-Length`, illegal chunk sizes/extensions/boundaries, malformed
+trailers or bytes after the last chunk); `payload_truncated` covers a
+message that is a syntactically valid prefix but ends before the body or
+the chunked encoding completes.
+
 ## Run locally
 
 ```bash
@@ -82,7 +98,7 @@ curl -s -X POST --data-binary @pkg.warc \
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v     # 42 parser unit tests
+python3 -m unittest discover -s tests -v     # 79 parser unit tests
 ```
 
 ## Docker & Docker Compose
@@ -96,8 +112,9 @@ against `/healthz`.
 HOST_PORT=9090 docker compose up --build
 
 # one-shot verification: waits for the API to be healthy, then runs the
-# build check, unit tests and valid / bad-digest / bad-reference API smoke
-# tests, reports via its exit code and exits
+# build check, unit tests and valid / bad-digest / bad-reference /
+# chunked-valid / chunked-malformed API smoke tests, reports via its
+# exit code and exits
 docker compose up --build verify
 docker compose ps            # verify shows Exited (0) on success
 ```
