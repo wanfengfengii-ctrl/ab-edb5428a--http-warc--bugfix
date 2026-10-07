@@ -58,6 +58,53 @@ def http_response_headers_only(
     return eol.join(lines) + eol + eol
 
 
+def http_response_chunked(
+    chunks: tuple[bytes, ...] | list[bytes] = (),
+    *,
+    status: int = 200,
+    reason: str = "OK",
+    extra_headers: tuple[tuple[str, str], ...] = (),
+    trailers: tuple[tuple[str, str], ...] = (),
+    version: str = "HTTP/1.1",
+) -> bytes:
+    """HTTP/1.1 response with ``Transfer-Encoding: chunked``.
+
+    ``chunks`` are the decoded entity pieces; each is emitted as one chunk,
+    followed by the last-chunk, optional trailer fields and the final CRLF.
+    The payload digest of such a response covers ``b"".join(chunks)`` while
+    the block digest covers the raw bytes returned here.
+    """
+    lines = [f"{version} {status} {reason}".encode("ascii")]
+    lines.append(b"Content-Type: application/octet-stream")
+    lines.append(b"Transfer-Encoding: chunked")
+    for name, value in extra_headers:
+        lines.append(f"{name}: {value}".encode())
+    out = bytearray(b"\r\n".join(lines) + b"\r\n\r\n")
+    for chunk in chunks:
+        out += f"{len(chunk):x}".encode("ascii") + b"\r\n" + chunk + b"\r\n"
+    out += b"0\r\n"
+    for name, value in trailers:
+        out += f"{name}: {value}".encode("ascii") + b"\r\n"
+    out += b"\r\n"
+    return bytes(out)
+
+
+def http_response_headers_only_chunked(
+    *,
+    status: int = 200,
+    reason: str = "OK",
+    extra_headers: tuple[tuple[str, str], ...] = (),
+    version: str = "HTTP/1.1",
+) -> bytes:
+    """Canonical chunked revisit block: headers only, not a single chunk."""
+    lines = [f"{version} {status} {reason}".encode("ascii")]
+    lines.append(b"Content-Type: application/octet-stream")
+    lines.append(b"Transfer-Encoding: chunked")
+    for name, value in extra_headers:
+        lines.append(f"{name}: {value}".encode())
+    return b"\r\n".join(lines) + b"\r\n\r\n"
+
+
 def warc_record(
     warc_type: str,
     block: bytes,

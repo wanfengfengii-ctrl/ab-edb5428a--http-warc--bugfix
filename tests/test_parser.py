@@ -14,7 +14,9 @@ from warc_audit.parser import ERR_BOUNDARY, ERR_CONTENT, WARCAuditError, audit_w
 from tests.warc_factory import (
     build_valid_archive,
     http_response,
+    http_response_chunked,
     http_response_headers_only,
+    http_response_headers_only_chunked,
     new_record_id,
     payload_digest_of,
     warc_record,
@@ -289,14 +291,6 @@ class ContentTests(unittest.TestCase):
         )
         self.assertRejects(rec, "invalid_http_message", record=1)
 
-    def test_chunked_http_rejected(self):
-        block = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n"
-        rec = warc_record(
-            "response", block, target_uri="http://e/",
-            payload_digest="sha256:" + hashlib.sha256(b"").hexdigest(),
-        )
-        self.assertRejects(rec, "invalid_http_message", record=1)
-
     def test_block_byte_corruption_detected(self):
         data, _ = build_valid_archive()
         # Flip a byte inside the first record's block.
@@ -304,6 +298,405 @@ class ContentTests(unittest.TestCase):
         idx = data.index(b"software:")
         bad[idx] = ord("Z")
         self.assertRejects(bytes(bad), "block_digest_mismatch", record=1)
+
+
+class ChunkedTransferTests(unittest.TestCase):
+    """HTTP/1.1 ``Transfer-Encoding: chunked`` inside response/revisit blocks.
+
+    The payload digest always covers the *decoded* entity; the block digest
+    always covers the raw, still transfer-coded record block.
+    """
+
+    def assertRejects(self, data, reason, record=None, code=ERR_CONTENT):
+        with self.assertRaises(WARCAuditError) as cm:
+            audit_warc(data)
+        err = cm.exception
+        self.assertEqual(err.reason, reason, err.message)
+        self.assertEqual(err.code, code)
+        if record is not None:
+            self.assertEqual(err.record, record)
+
+    def assertAccepts(self, data, expect_payload: bytes, record=0):
+        result = audit_warc(data)
+        r = result.records[record]
+        self.assertEqual(r.payload_digest, hashlib.sha256(expect_payload).hexdigest())
+        return r
+
+    # -- legal forms ----------------------------------------------------
+
+    def test_two_chunk_wikipedia_response_accepted(self):
+        # The acceptance scenario: "Wikipedia" as chunks of 4 and 5 bytes.
+        body = b"Wikipedia"
+        block = http_response_chunked([b"Wiki", b"pedia"])
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(body),
+        )
+        r = self.assertAccepts(rec, body)
+        self.assertEqual(r.block_digest, hashlib.sha256(block).hexdigest())
+        self.assertEqual(r.block_length, len(block))
+
+    def test_block_digest_covers_raw_chunked_bytes(self):
+        # Declaring the *decoded* entity as the block digest must fail: the
+        # block digest covers the undecoded chunked message.
+        block = http_response_chunked([b"Wiki", b"pedia"])
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(b"Wikipedia"),
+            block_digest="sha256:" + hashlib.sha256(b"Wikipedia").hexdigest(),
+        )
+        self.assertRejects(rec, "block_digest_mismatch", record=1)
+
+    def test_payload_digest_must_skip_transfer_coding(self):
+        # A digest over the raw chunked bytes is not the payload digest.
+        block = http_response_chunked([b"Wiki", b"pedia"])
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest="sha256:" + hashlib.sha256(block).hexdigest(),
+        )
+        self.assertRejects(rec, "payload_digest_mismatch", record=1)
+
+    def test_single_chunk_and_empty_entity(self):
+        for chunks, expect in (([b"x"], b"x"), ([], b"")):
+            block = http_response_chunked(chunks)
+            rec = warc_record(
+                "response", block, target_uri="http://e/",
+                payload_digest=payload_digest_of(expect),
+            )
+            self.assertAccepts(rec, expect)
+
+    def test_many_single_byte_chunks(self):
+        chunks = [bytes([c]) for c in b"abcdefghijklmnopqrstuvwxyz"]
+        block = http_response_chunked(chunks)
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(b"abcdefghijklmnopqrstuvwxyz"),
+        )
+        self.assertAccepts(rec, b"abcdefghijklmnopqrstuvwxyz")
+
+    def test_chunk_extensions_and_trailers_accepted(self):
+        block = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            b"4;checksum=af32;note=\"a;b\";bare\r\nWiki\r\n"
+            b"5;x=1;y=\"\"\r\npedia\r\n"
+            b"0;done=yes\r\n"
+            b"X-Trailer-Note: end of stream\r\n"
+            b"Content-MD5: abc123\r\n"
+            b"\r\n"
+        )
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(b"Wikipedia"),
+        )
+        self.assertAccepts(rec, b"Wikipedia")
+
+    def test_uppercase_hex_and_leading_zero_sizes(self):
+        block = (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"A\r\n0123456789\r\n"
+            b"0004\r\nWiki\r\n"
+            b"00\r\n\r\n"
+        )
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(b"0123456789Wiki"),
+        )
+        self.assertAccepts(rec, b"0123456789Wiki")
+
+    def test_case_insensitive_transfer_encoding_token(self):
+        block = http_response_chunked([b"xy"]).replace(
+            b"Transfer-Encoding: chunked", b"Transfer-Encoding: Chunked"
+        )
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(b"xy"),
+        )
+        self.assertAccepts(rec, b"xy")
+
+    def test_chunked_revisit_headers_only_accepted(self):
+        body = b"Wikipedia"
+        rid = new_record_id()
+        pd = payload_digest_of(body)
+        data = b"".join(
+            [
+                warc_record(
+                    "response", http_response_chunked([b"Wiki", b"pedia"]),
+                    record_id=rid, target_uri="http://e/", payload_digest=pd,
+                ),
+                warc_record(
+                    "revisit", http_response_headers_only_chunked(),
+                    target_uri="http://e/", payload_digest=pd, refers_to=rid,
+                ),
+            ]
+        )
+        result = audit_warc(data)
+        self.assertEqual(result.records[1].payload_digest, result.records[0].payload_digest)
+
+    def test_chunked_revisit_with_full_body_accepted(self):
+        body = b"Wikipedia"
+        rid = new_record_id()
+        pd = payload_digest_of(body)
+        data = b"".join(
+            [
+                warc_record(
+                    "response", http_response_chunked([b"Wiki", b"pedia"]),
+                    record_id=rid, target_uri="http://e/", payload_digest=pd,
+                ),
+                warc_record(
+                    "revisit", http_response_chunked([b"Wikipedia"]),
+                    target_uri="http://e/", payload_digest=pd, refers_to=rid,
+                ),
+            ]
+        )
+        result = audit_warc(data)
+        self.assertEqual(result.records[1].payload_digest, result.records[0].payload_digest)
+
+    def test_chunked_revisit_digest_mismatch_rejected(self):
+        rid = new_record_id()
+        data = b"".join(
+            [
+                warc_record(
+                    "response", http_response_chunked([b"Wiki", b"pedia"]),
+                    record_id=rid, target_uri="http://e/",
+                    payload_digest=payload_digest_of(b"Wikipedia"),
+                ),
+                warc_record(
+                    "revisit", http_response_chunked([b"Wik", b"ipedia"]),
+                    target_uri="http://e/",
+                    payload_digest=payload_digest_of(b"WikipediaX"), refers_to=rid,
+                ),
+            ]
+        )
+        # The revisit's declared digest matches neither its own decoded
+        # entity nor the referenced response's.
+        self.assertRejects(data, "payload_digest_mismatch", record=2)
+
+    def test_mixed_framing_archive(self):
+        # Content-Length response and chunked response in one archive; a
+        # revisit may reference either.
+        body1, body2 = b"plain body", b"Wikipedia"
+        rid1, rid2 = new_record_id(), new_record_id()
+        data = b"".join(
+            [
+                warc_record(
+                    "response", http_response(body1), record_id=rid1,
+                    target_uri="http://a/", payload_digest=payload_digest_of(body1),
+                ),
+                warc_record(
+                    "response", http_response_chunked([b"Wiki", b"pedia"]),
+                    record_id=rid2, target_uri="http://b/",
+                    payload_digest=payload_digest_of(body2),
+                ),
+                warc_record(
+                    "revisit", http_response_headers_only_chunked(),
+                    target_uri="http://b/",
+                    payload_digest=payload_digest_of(body2), refers_to=rid2,
+                ),
+                warc_record(
+                    "revisit", http_response_headers_only(len(body1)),
+                    target_uri="http://a/",
+                    payload_digest=payload_digest_of(body1), refers_to=rid1,
+                ),
+            ]
+        )
+        result = audit_warc(data)
+        self.assertEqual(len(result.records), 4)
+        self.assertEqual(result.records[2].payload_digest, hashlib.sha256(body2).hexdigest())
+        self.assertEqual(result.records[3].payload_digest, hashlib.sha256(body1).hexdigest())
+
+    # -- malformed framing ------------------------------------------------
+
+    def test_te_and_content_length_together_rejected(self):
+        block = http_response_chunked([b"Wiki"], extra_headers=(("Content-Length", "4"),))
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(b"Wiki"),
+        )
+        self.assertRejects(rec, "invalid_http_message", record=1)
+
+    def test_non_chunked_transfer_coding_rejected(self):
+        block = (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nabc"
+        )
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(b"abc"),
+        )
+        self.assertRejects(rec, "invalid_http_message", record=1)
+
+    def test_layered_transfer_coding_rejected(self):
+        for te in (b"gzip, chunked", b"chunked, chunked", b"chunked, identity"):
+            block = (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: " + te + b"\r\n\r\n"
+                b"1\r\nx\r\n0\r\n\r\n"
+            )
+            rec = warc_record(
+                "response", block, target_uri="http://e/",
+                payload_digest=payload_digest_of(b"x"),
+            )
+            self.assertRejects(rec, "invalid_http_message", record=1)
+
+    def test_chunked_over_http10_rejected(self):
+        block = http_response_chunked([b"x"], version="HTTP/1.0")
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(b"x"),
+        )
+        self.assertRejects(rec, "invalid_http_message", record=1)
+
+    def test_bad_chunk_size_rejected(self):
+        for size_line in (b"Z", b"4x", b"+4", b"-4", b"4 ", b" 4", b"", b"0x10"):
+            block = (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + size_line + b"\r\nWiki\r\n0\r\n\r\n"
+            )
+            rec = warc_record(
+                "response", block, target_uri="http://e/",
+                payload_digest=payload_digest_of(b"Wiki"),
+            )
+            self.assertRejects(rec, "invalid_http_message", record=1)
+
+    def test_bad_chunk_extension_rejected(self):
+        for ext in (b";", b";=x", b";foo=", b";foo=\"open", b";foo=bar baz", b"; foo=1"):
+            block = (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                b"4" + ext + b"\r\nWiki\r\n0\r\n\r\n"
+            )
+            rec = warc_record(
+                "response", block, target_uri="http://e/",
+                payload_digest=payload_digest_of(b"Wiki"),
+            )
+            self.assertRejects(rec, "invalid_http_message", record=1)
+
+    def test_missing_crlf_after_chunk_data_rejected(self):
+        block = (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"4\r\nWikiXX0\r\n\r\n"
+        )
+        rec = warc_record(
+            "response", block, target_uri="http://e/",
+            payload_digest=payload_digest_of(b"Wiki"),
+        )
+        self.assertRejects(rec, "invalid_http_message", record=1)
+
+    def test_bytes_after_terminating_chunk_rejected(self):
+        for tail in (b"X", b"\r\n", b"0\r\n\r\n"):
+            block = (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                b"1\r\nx\r\n0\r\n\r\n" + tail
+            )
+            rec = warc_record(
+                "response", block, target_uri="http://e/",
+                payload_digest=payload_digest_of(b"x"),
+            )
+            self.assertRejects(rec, "invalid_http_message", record=1)
+
+    def test_framing_trailer_fields_rejected(self):
+        for trailer in (b"Content-Length: 4", b"Transfer-Encoding: chunked", b"Trailer: X", b"Host: e"):
+            block = (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                b"4\r\nWiki\r\n0\r\n" + trailer + b"\r\n\r\n"
+            )
+            rec = warc_record(
+                "response", block, target_uri="http://e/",
+                payload_digest=payload_digest_of(b"Wiki"),
+            )
+            self.assertRejects(rec, "invalid_http_message", record=1)
+
+    def test_malformed_trailer_fields_rejected(self):
+        for trailer in (b" folded", b"no-colon-here", b"Bad Name: x", b"X: a\nb"):
+            block = (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                b"4\r\nWiki\r\n0\r\n" + trailer + b"\r\n\r\n"
+            )
+            rec = warc_record(
+                "response", block, target_uri="http://e/",
+                payload_digest=payload_digest_of(b"Wiki"),
+            )
+            self.assertRejects(rec, "invalid_http_message", record=1)
+
+    # -- truncation -------------------------------------------------------
+
+    def test_truncated_chunked_response_rejected(self):
+        heads = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        full = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"
+        # Every strict prefix of a legal chunked body is incomplete.
+        for cut in range(0, len(full)):
+            block = heads + full[:cut]
+            rec = warc_record(
+                "response", block, target_uri="http://e/",
+                payload_digest=payload_digest_of(b"Wikipedia"),
+            )
+            with self.assertRaises(WARCAuditError) as cm:
+                audit_warc(rec)
+            err = cm.exception
+            self.assertEqual(err.code, ERR_CONTENT, (cut, err.message))
+            self.assertEqual(err.record, 1)
+            self.assertIn(err.reason, ("payload_truncated", "invalid_http_message"), (cut, err.reason))
+
+    def test_truncated_chunked_response_reason(self):
+        heads = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        for body, reason in (
+            (b"", "payload_truncated"),                # no chunks at all
+            (b"4\r\nWi", "payload_truncated"),         # mid chunk-data
+            (b"4\r\nWiki\r\n", "payload_truncated"),   # last-chunk missing
+            (b"4\r\nWiki\r\n0\r\n", "payload_truncated"),  # final CRLF missing
+            (b"4\r\nWiki\r\n0\r\nX-Note: a\r\n", "payload_truncated"),
+            (b"4\r\nWiXX", "payload_truncated"),     # data present, CRLF cut
+            (b"4\r\nWikiXX", "invalid_http_message"),  # bad boundary, not truncation
+        ):
+            rec = warc_record(
+                "response", heads + body, target_uri="http://e/",
+                payload_digest=payload_digest_of(b"Wikipedia"),
+            )
+            self.assertRejects(rec, reason, record=1)
+
+    def test_partial_chunked_revisit_rejected(self):
+        body = b"Wikipedia"
+        rid = new_record_id()
+        pd = payload_digest_of(body)
+        partial = (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"4\r\nWi"
+        )
+        data = b"".join(
+            [
+                warc_record(
+                    "response", http_response_chunked([b"Wiki", b"pedia"]),
+                    record_id=rid, target_uri="http://e/", payload_digest=pd,
+                ),
+                warc_record(
+                    "revisit", partial, target_uri="http://e/",
+                    payload_digest=pd, refers_to=rid,
+                ),
+            ]
+        )
+        self.assertRejects(data, "payload_truncated", record=2)
+
+    def test_invalid_chunked_revisit_rejected(self):
+        body = b"Wikipedia"
+        rid = new_record_id()
+        pd = payload_digest_of(body)
+        malformed = (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"4\r\nWiki\r\n0\r\n\r\nEXTRA"
+        )
+        data = b"".join(
+            [
+                warc_record(
+                    "response", http_response_chunked([b"Wiki", b"pedia"]),
+                    record_id=rid, target_uri="http://e/", payload_digest=pd,
+                ),
+                warc_record(
+                    "revisit", malformed, target_uri="http://e/",
+                    payload_digest=pd, refers_to=rid,
+                ),
+            ]
+        )
+        self.assertRejects(data, "invalid_http_message", record=2)
 
 
 class RevisitReferenceTests(unittest.TestCase):

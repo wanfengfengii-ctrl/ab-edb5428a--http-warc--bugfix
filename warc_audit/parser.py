@@ -4,7 +4,9 @@ The parser deliberately avoids the tolerant ``http.client`` header parser:
 forensic ingestion must reject malformed framing rather than guess around it.
 Every byte of the declared record block is covered by the WARC-Block-Digest,
 and response/revisit records additionally carry a payload digest computed
-over the HTTP entity body bytes described by the record's HTTP headers.
+over the HTTP entity body bytes described by the record's HTTP headers —
+with any HTTP/1.1 chunked transfer coding removed first.  The block digest
+always covers the raw, still transfer-coded bytes; the two never mix.
 """
 
 from __future__ import annotations
@@ -228,7 +230,15 @@ def audit_warc(data: bytes) -> AuditResult:
         cl_raw = required("content-length")
         if not _is_nonneg_integer(cl_raw):
             _fail(ERR_BOUNDARY, record_no, "invalid_content_length", "Content-Length must be a non-negative decimal integer")
-        content_length = int(cl_raw)
+        try:
+            content_length = int(cl_raw)
+        except ValueError:  # absurdly long digit string
+            _fail(
+                ERR_BOUNDARY,
+                record_no,
+                "invalid_content_length",
+                "Content-Length has an unreasonable number of digits",
+            )
 
         block_start = pos
         block_end = block_start + content_length
@@ -310,9 +320,12 @@ def audit_warc(data: bytes) -> AuditResult:
         payload_digest: str | None = None
         if partial.warc_type in ("response", "revisit"):
             # The block is a full HTTP response message: status line, headers,
-            # then the entity body bytes described by HTTP Content-Length.
-            payload_bytes, http_ok, body_complete = _http_entity_body(block)
-            if not http_ok:
+            # then the entity body — Content-Length delimited or HTTP/1.1
+            # chunked.  The payload digest always covers the entity with any
+            # transfer coding removed; the block digest above covered the
+            # untouched raw bytes.
+            payload_bytes, http_status, chunked = _http_entity_body(block)
+            if http_status == _HTTP_INVALID:
                 _fail(
                     ERR_CONTENT,
                     idx,
@@ -324,13 +337,16 @@ def audit_warc(data: bytes) -> AuditResult:
 
             if partial.warc_type == "response":
                 # A response must carry the complete entity body, which is
-                # hashed directly.  Truncation is never tolerated.
-                if not body_complete:
+                # hashed after removing any transfer coding.  Truncation is
+                # never tolerated.
+                if http_status != _HTTP_COMPLETE:
                     _fail(
                         ERR_CONTENT,
                         idx,
                         "payload_truncated",
-                        "HTTP entity body is shorter than its Content-Length",
+                        "chunked HTTP entity body is incomplete"
+                        if chunked
+                        else "HTTP entity body is shorter than its Content-Length",
                     )
                 if hashlib.sha256(payload_bytes).hexdigest() != payload_digest:
                     _fail(
@@ -345,14 +361,14 @@ def audit_warc(data: bytes) -> AuditResult:
                 # reference equality check against the earlier response.  If a
                 # body *is* present it must be complete and hash correctly; a
                 # partially present body is ambiguous and rejected.
-                if len(payload_bytes) > 0 and not body_complete:
+                if http_status == _HTTP_TRUNCATED:
                     _fail(
                         ERR_CONTENT,
                         idx,
                         "payload_truncated",
                         "revisit carries a partial HTTP entity body",
                     )
-                if body_complete and hashlib.sha256(payload_bytes).hexdigest() != payload_digest:
+                if http_status == _HTTP_COMPLETE and hashlib.sha256(payload_bytes).hexdigest() != payload_digest:
                     _fail(
                         ERR_CONTENT,
                         idx,
@@ -461,57 +477,247 @@ def _parse_sha256_digest(value: str, idx: int, *, what: str) -> str:
     return hexpart
 
 
-def _http_entity_body(block: bytes) -> tuple[bytes, bool, bool]:
+# ---------------------------------------------------------------------------
+# HTTP entity extraction
+# ---------------------------------------------------------------------------
+
+# Outcomes of _http_entity_body.  "complete" and "truncated" mirror the
+# Content-Length semantics; "absent" is the canonical headers-only revisit
+# shape; "invalid" covers any framing or syntax violation.
+_HTTP_COMPLETE = "complete"
+_HTTP_ABSENT = "absent"
+_HTTP_TRUNCATED = "truncated"
+_HTTP_INVALID = "invalid"
+
+_HEXDIGITS = frozenset(b"0123456789abcdefABCDEF")
+_TCHARS = frozenset(
+    b"!#$%&'*+-.^_`|~"
+    b"0123456789"
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
+
+# Trailer fields that would alter message framing or routing must never
+# appear (RFC 7230 §4.1.2 forbids generating them); accepting one would
+# make the verified entity boundary ambiguous.
+_FORBIDDEN_TRAILER_NAMES = frozenset(
+    {"content-length", "transfer-encoding", "trailer", "host"}
+)
+
+
+def _http_entity_body(block: bytes) -> tuple[bytes, str, bool]:
     """Split a block that must be a full HTTP response message.
 
-    Returns ``(entity_body, http_ok, body_complete)``:
+    Returns ``(entity_body, status, chunked)``:
 
-    * ``http_ok`` is False when the block is not a CRLF-delimited HTTP
-      response with parseable, non-duplicated headers and a single
-      non-negative ``Content-Length`` (chunked transfer-encoding is not
-      accepted — guessing framing would defeat byte verification).
-    * ``body_complete`` is True when the body present in the block has
-      exactly the declared length.  A canonical revisit block carries
-      headers only, so its body may legitimately be absent; a partially
-      present body is reported as incomplete and rejected by the caller.
+    * ``entity_body`` is the payload with any transfer coding removed — for
+      a chunked message these are the concatenated chunk-data bytes, never
+      the raw on-the-wire body;
+    * ``status`` is one of ``"complete"`` / ``"absent"`` / ``"truncated"`` /
+      ``"invalid"``.  A canonical revisit block carries headers only, so its
+      body may legitimately be absent; a partially present body is reported
+      as truncated and rejected by the caller;
+    * ``chunked`` records which framing was in force, for diagnostics.
+
+    Framing is strict: a single ``Content-Length`` or — for HTTP/1.1 only —
+    a bare ``chunked`` transfer coding.  Both together, repeated or
+    additional codings and any other transfer coding are refused rather than
+    guessed at, because guessing framing would defeat byte verification.
     """
     sep = b"\r\n\r\n"
     head_end = block.find(sep)
     if head_end == -1:
-        return b"", False, False
+        return b"", _HTTP_INVALID, False
     head = block[:head_end]
     body = block[head_end + 4 :]
     lines = head.split(b"\r\n")
     status_line = lines[0]
-    if not status_line.startswith(b"HTTP/1.1 ") and not status_line.startswith(b"HTTP/1.0 "):
-        return b"", False, False
+    http11 = status_line.startswith(b"HTTP/1.1 ")
+    if not http11 and not status_line.startswith(b"HTTP/1.0 "):
+        return b"", _HTTP_INVALID, False
     try:
         status_line.decode("ascii")
     except UnicodeDecodeError:
-        return b"", False, False
+        return b"", _HTTP_INVALID, False
 
     headers: dict[str, bytes] = {}
     for line in lines[1:]:
         colon = line.find(b":")
         if colon <= 0:
-            return b"", False, False
+            return b"", _HTTP_INVALID, False
         try:
             name = line[:colon].decode("ascii").lower()
         except UnicodeDecodeError:
-            return b"", False, False
+            return b"", _HTTP_INVALID, False
         value = line[colon + 1 :].strip()
         if name in headers:  # duplicated HTTP header — refuse rather than merge
-            return b"", False, False
+            return b"", _HTTP_INVALID, False
         headers[name] = value
 
     te = headers.get("transfer-encoding", b"").lower()
     if te:
-        return b"", False, False
+        # Only a bare "chunked" coding can be removed deterministically.
+        if te != b"chunked":
+            return b"", _HTTP_INVALID, False
+        if not http11 or "content-length" in headers:
+            return b"", _HTTP_INVALID, True
+        if len(body) == 0:
+            return b"", _HTTP_ABSENT, True
+        decoded, status = _decode_chunked(body)
+        return decoded, status, True
 
     cl = headers.get("content-length")
     if cl is None or not _is_nonneg_integer(cl):
-        return b"", False, False
-    length = int(cl)
+        return b"", _HTTP_INVALID, False
+    try:
+        length = int(cl)
+    except ValueError:  # absurdly long digit string
+        return b"", _HTTP_INVALID, False
     if len(body) > length:  # bytes beyond the declared entity body
-        return b"", False, False
-    return body, True, len(body) == length
+        return b"", _HTTP_INVALID, False
+    if len(body) == 0 and length > 0:
+        return b"", _HTTP_ABSENT, False
+    if len(body) < length:
+        return body, _HTTP_TRUNCATED, False
+    return body, _HTTP_COMPLETE, False
+
+
+def _decode_chunked(body: bytes) -> tuple[bytes, str]:
+    """Decode an HTTP/1.1 ``chunked`` body, strictly per RFC 7230 §4.1.
+
+    Returns ``(decoded, status)`` with status ``"complete"`` (last-chunk,
+    trailer part and final CRLF all present, nothing after), ``"truncated"``
+    (the input ended at a point where more bytes were required) or
+    ``"invalid"`` (a present byte violates the grammar).  The decoded bytes
+    are the concatenated chunk-data; chunk extensions are validated and
+    ignored, and trailer fields are validated but do not contribute to the
+    payload.
+    """
+    decoded = bytearray()
+    pos = 0
+    n = len(body)
+    while True:
+        line_end = body.find(b"\r\n", pos)
+        if line_end == -1:
+            # The size line is cut off: a clean hex prefix is truncation,
+            # anything else was never a size line at all.
+            if all(c in _HEXDIGITS for c in body[pos:]):
+                return bytes(decoded), _HTTP_TRUNCATED
+            return b"", _HTTP_INVALID
+        size = _parse_chunk_size_line(body[pos:line_end])
+        if size is None:
+            return b"", _HTTP_INVALID
+        pos = line_end + 2
+        if size > 0:
+            if pos + size > n:
+                return bytes(decoded), _HTTP_TRUNCATED
+            decoded += body[pos : pos + size]
+            pos += size
+            if pos + 2 > n:
+                return bytes(decoded), _HTTP_TRUNCATED
+            if body[pos : pos + 2] != b"\r\n":
+                return b"", _HTTP_INVALID
+            pos += 2
+            continue
+        # last-chunk: trailer part, then the CRLF ending the message.
+        while True:
+            line_end = body.find(b"\r\n", pos)
+            if line_end == -1:
+                remaining = body[pos:]
+                if b"\r" not in remaining and b"\n" not in remaining:
+                    return bytes(decoded), _HTTP_TRUNCATED
+                return b"", _HTTP_INVALID
+            line = body[pos:line_end]
+            pos = line_end + 2
+            if line == b"":
+                if pos != n:
+                    return b"", _HTTP_INVALID  # bytes after the message end
+                return bytes(decoded), _HTTP_COMPLETE
+            if not _valid_trailer_field(line):
+                return b"", _HTTP_INVALID
+
+
+def _parse_chunk_size_line(line: bytes) -> int | None:
+    """Parse ``chunk-size [ chunk-ext ]``; ``None`` when not well-formed."""
+    semi = line.find(b";")
+    size_part = line if semi == -1 else line[:semi]
+    if not size_part or any(c not in _HEXDIGITS for c in size_part):
+        return None
+    if semi != -1 and not _valid_chunk_ext(line[semi:]):
+        return None
+    try:
+        return int(size_part, 16)
+    except ValueError:
+        return None
+
+
+def _valid_chunk_ext(ext: bytes) -> bool:
+    """Validate a chunk extension string (from the first ``;`` onward).
+
+    Grammar (RFC 7230 §4.1.1): ``*( ";" chunk-ext-name [ "=" chunk-ext-val ] )``
+    with ``chunk-ext-val = token / quoted-string``.  Well-formed extensions
+    are accepted and ignored, as recipients must; malformed ones are not.
+    """
+    i = 0
+    n = len(ext)
+    while i < n:
+        if ext[i] != 0x3B:  # ";"
+            return False
+        i += 1
+        start = i
+        while i < n and ext[i] in _TCHARS:
+            i += 1
+        if i == start:
+            return False  # empty extension name
+        if i < n and ext[i] == 0x3D:  # "="
+            i += 1
+            if i < n and ext[i] == 0x22:  # quoted-string value
+                i += 1
+                closed = False
+                while i < n:
+                    c = ext[i]
+                    if c == 0x5C:  # quoted-pair: "\" ( HTAB / SP / VCHAR / obs-text )
+                        if i + 1 >= n:
+                            return False
+                        nxt = ext[i + 1]
+                        if not (nxt in (0x09, 0x20) or 0x21 <= nxt <= 0x7E or nxt >= 0x80):
+                            return False
+                        i += 2
+                    elif c == 0x22:  # closing DQUOTE
+                        i += 1
+                        closed = True
+                        break
+                    elif c in (0x09, 0x20) or c == 0x21 or 0x23 <= c <= 0x5B or 0x5D <= c <= 0x7E or c >= 0x80:
+                        i += 1  # qdtext
+                    else:
+                        return False
+                if not closed:
+                    return False
+            else:
+                start = i
+                while i < n and ext[i] in _TCHARS:
+                    i += 1
+                if i == start:
+                    return False  # empty token value
+    return True
+
+
+def _valid_trailer_field(line: bytes) -> bool:
+    """Validate one trailer field line (without its CRLF).
+
+    Same shape rules as a strict header field — no folding, a token field
+    name, no control characters in the value — plus the RFC 7230 §4.1.2
+    prohibition of trailer fields that would alter message framing.
+    """
+    if line[:1] in (b" ", b"\x09"):
+        return False  # folded trailer line
+    colon = line.find(b":")
+    if colon <= 0:
+        return False
+    name = line[:colon]
+    if any(c not in _TCHARS for c in name):
+        return False
+    if name.decode("ascii").lower() in _FORBIDDEN_TRAILER_NAMES:
+        return False
+    value = line[colon + 1 :].strip(b" \x09")
+    # field-content allows VCHAR / obs-text joined by SP/HTAB — no controls.
+    return all(c in (0x09, 0x20) or 0x21 <= c <= 0x7E or c >= 0x80 for c in value)

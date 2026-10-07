@@ -22,10 +22,17 @@ or `revisit`):
 - `Content-Length` matches the block bytes exactly and the block is
   terminated by the canonical `CRLF CRLF` record terminator.
 - `WARC-Block-Digest` is `sha256:` + 64 lowercase hex chars and matches the
-  declared block bytes.
+  declared block bytes — always the **raw, un-decoded** record block.
 - `response` / `revisit` also carry a `WARC-Payload-Digest` over the HTTP
-  entity body. A `response` must contain the complete body; a canonical
-  headers-only `revisit` has its digest proven via the reference below.
+  entity body. The entity is either `Content-Length` delimited or HTTP/1.1
+  `Transfer-Encoding: chunked`; for chunked messages the digest covers the
+  **decoded** entity (concatenated chunk-data), never the on-the-wire bytes.
+  Chunk sizes, chunk boundaries, the terminating chunk, chunk extensions and
+  trailer fields are validated strictly per RFC 7230 §4.1; truncation, bad
+  boundaries, bytes after the terminator, `Transfer-Encoding` combined with
+  `Content-Length`, and any non-`chunked` coding are all rejected. A
+  `response` must contain the complete body; a canonical headers-only
+  `revisit` has its digest proven via the reference below.
 - A `revisit` may only use `WARC-Refers-To` to point to an **earlier**
   `response` in the same file whose payload digest is identical. Forward and
   dangling references, references to non-responses and payload mismatches are
@@ -82,7 +89,7 @@ curl -s -X POST --data-binary @pkg.warc \
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v     # 42 parser unit tests
+python3 -m unittest discover -s tests -v     # 67 parser unit tests
 ```
 
 ## Docker & Docker Compose
@@ -96,8 +103,8 @@ against `/healthz`.
 HOST_PORT=9090 docker compose up --build
 
 # one-shot verification: waits for the API to be healthy, then runs the
-# build check, unit tests and valid / bad-digest / bad-reference API smoke
-# tests, reports via its exit code and exits
+# build check, unit tests and valid / bad-digest / bad-reference / chunked
+# API smoke tests, reports via its exit code and exits
 docker compose up --build verify
 docker compose ps            # verify shows Exited (0) on success
 ```
